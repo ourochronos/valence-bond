@@ -33,6 +33,7 @@ pub enum MessageType {
     StorageProof,
     ShardQuery,
     ShardQueryResponse,
+    ChallengeResult,
     // §7 Votes
     Vote,
     // §8 Reputation
@@ -49,6 +50,7 @@ impl MessageType {
                 | MessageType::Propose
                 | MessageType::Withdraw
                 | MessageType::Adopt
+                | MessageType::ChallengeResult
                 | MessageType::Vote
                 | MessageType::ReputationGossip
                 | MessageType::KeyRotate
@@ -71,7 +73,8 @@ impl MessageType {
             MessageType::Request
             | MessageType::Propose
             | MessageType::Withdraw
-            | MessageType::Adopt => Some("/valence/proposals"),
+            | MessageType::Adopt
+            | MessageType::ChallengeResult => Some("/valence/proposals"),
 
             MessageType::Vote => Some("/valence/votes"),
 

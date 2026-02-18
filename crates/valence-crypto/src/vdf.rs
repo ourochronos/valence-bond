@@ -9,6 +9,14 @@
 use sha2::{Digest, Sha256};
 use valence_core::constants::{VDF_CHECKPOINT_INTERVAL, VDF_DIFFICULTY};
 
+/// Get current unix timestamp in milliseconds.
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+}
+
 /// A VDF proof with intermediate checkpoints.
 #[derive(Debug, Clone)]
 pub struct VdfProof {
@@ -18,6 +26,8 @@ pub struct VdfProof {
     pub input_data: Vec<u8>,
     /// Difficulty (number of iterations).
     pub difficulty: u64,
+    /// When the VDF computation began (unix milliseconds) per §9.
+    pub computed_at: i64,
     /// Checkpoint hashes at every checkpoint_interval iterations.
     pub checkpoints: Vec<VdfCheckpoint>,
 }
@@ -30,6 +40,7 @@ pub struct VdfCheckpoint {
 
 /// Compute a VDF proof over the given input.
 pub fn compute(input: &[u8], difficulty: u64) -> VdfProof {
+    let computed_at = now_ms();
     let checkpoint_interval = if difficulty >= VDF_CHECKPOINT_INTERVAL {
         VDF_CHECKPOINT_INTERVAL
     } else {
@@ -54,6 +65,7 @@ pub fn compute(input: &[u8], difficulty: u64) -> VdfProof {
         output: h,
         input_data: input.to_vec(),
         difficulty,
+        computed_at,
         checkpoints,
     }
 }
@@ -65,9 +77,32 @@ pub fn compute_standard(public_key_bytes: &[u8]) -> VdfProof {
 
 /// Verify a VDF proof by spot-checking segments.
 /// Returns Ok(()) if valid, Err with description if invalid.
+/// Per §9: rejects proofs where `computed_at` is older than 24 hours or >5 minutes in the future.
 pub fn verify(proof: &VdfProof, min_segments: usize) -> Result<(), String> {
     if proof.checkpoints.is_empty() {
         return Err("No checkpoints in proof".to_string());
+    }
+
+    // Timestamp validation per §9
+    let now = now_ms();
+    let age_ms = now - proof.computed_at;
+    let max_age_ms = 24 * 60 * 60 * 1000; // 24 hours
+    let max_future_ms = 5 * 60 * 1000;    // 5 minutes
+
+    if age_ms > max_age_ms {
+        return Err(format!(
+            "VDF proof too old: computed_at {} is {} hours old (max 24 hours)",
+            proof.computed_at,
+            age_ms / (60 * 60 * 1000)
+        ));
+    }
+
+    if age_ms < -max_future_ms {
+        return Err(format!(
+            "VDF proof timestamp too far in future: computed_at {} is {} minutes ahead (max 5 minutes)",
+            proof.computed_at,
+            -age_ms / (60 * 1000)
+        ));
     }
 
     // Verify input_data matches (caller should check this is the node's public key)
@@ -172,5 +207,35 @@ mod tests {
             cp.hash[0] ^= 0xff;
         }
         assert!(verify(&proof, 5).is_err());
+    }
+
+    #[test]
+    fn vdf_proof_timestamp_too_old() {
+        let input = b"test_public_key_bytes_here_32byt";
+        let mut proof = compute(input, 10);
+        // Set timestamp to 25 hours ago
+        proof.computed_at = now_ms() - (25 * 60 * 60 * 1000);
+        let result = verify(&proof, 5);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("too old"));
+    }
+
+    #[test]
+    fn vdf_proof_timestamp_too_far_future() {
+        let input = b"test_public_key_bytes_here_32byt";
+        let mut proof = compute(input, 10);
+        // Set timestamp to 6 minutes in the future
+        proof.computed_at = now_ms() + (6 * 60 * 1000);
+        let result = verify(&proof, 5);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("future"));
+    }
+
+    #[test]
+    fn vdf_proof_timestamp_valid_recent() {
+        let input = b"test_public_key_bytes_here_32byt";
+        let proof = compute(input, 10);
+        // Fresh proof should pass
+        assert!(verify(&proof, 5).is_ok());
     }
 }

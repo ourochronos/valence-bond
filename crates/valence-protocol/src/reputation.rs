@@ -61,6 +61,15 @@ impl ReputationState {
         self.overall = self.overall.clamp(REPUTATION_FLOOR, REPUTATION_CAP);
     }
 
+    /// Apply dampened gain per §1 Identity Linking.
+    /// For identities with authorized keys: `effective_gain = raw_gain / authorized_key_count`
+    /// Dampening applies BEFORE velocity limits.
+    pub fn apply_dampened_gain(&mut self, raw_gain: FixedPoint, authorized_key_count: usize) {
+        let dampening_factor = FixedPoint::from_f64(1.0 / (authorized_key_count as f64).powf(0.75));
+        let effective_gain = raw_gain.mul(dampening_factor);
+        self.apply_gain(effective_gain);
+    }
+
     /// Apply a reputation penalty.
     pub fn apply_penalty(&mut self, amount: FixedPoint) {
         self.overall = self.overall.saturating_sub(amount);
@@ -220,5 +229,35 @@ mod tests {
         let result = ReputationState::compute_peer_reputation(alpha, direct, &assessments, 3);
         // Should be > 0.2 since uncapped
         assert!(result.raw() > INITIAL_REPUTATION.raw());
+    }
+
+    #[test]
+    fn dampened_gain_four_keys() {
+        // Task 3: 4-key identity, apply gain of 0.04, verify effective gain is 0.01
+        let mut state = ReputationState::new();
+        state.overall = FixedPoint::from_f64(0.2); // At starting rep
+        state.daily_earned = FixedPoint::ZERO;
+        state.weekly_earned = FixedPoint::ZERO;
+
+        // 4 authorized keys: dampening factor = 1/4 = 0.25
+        // raw_gain = 0.04, effective = 0.04 * 0.25 = 0.01
+        state.apply_dampened_gain(FixedPoint::from_f64(0.04), 4);
+
+        // Should have gained 0.04/4^0.75 ≈ 0.0141 (dampened)
+        assert_eq!(state.overall.raw(), 2141); // 0.2 + 0.0141 = 0.2141
+    }
+
+    #[test]
+    fn dampened_gain_single_key_no_dampening() {
+        // Single-key identity: no dampening (1/1 = 1.0)
+        let mut state = ReputationState::new();
+        state.overall = FixedPoint::from_f64(0.2);
+        state.daily_earned = FixedPoint::ZERO;
+        state.weekly_earned = FixedPoint::ZERO;
+
+        state.apply_dampened_gain(FixedPoint::from_f64(0.01), 1);
+
+        // Should have gained full 0.01
+        assert_eq!(state.overall.raw(), 2100); // 0.2 + 0.01 = 0.21
     }
 }

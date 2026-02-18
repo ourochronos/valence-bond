@@ -40,10 +40,10 @@ impl Identity {
     }
 
     /// Reputation gain dampening factor per §1:
-    /// `1.0 / sqrt(authorized_key_count)`
+    /// LINEAR dampening: `1.0 / authorized_key_count`
     pub fn gain_dampening(&self) -> FixedPoint {
         let count = self.authorized_key_count() as f64;
-        FixedPoint::from_f64(1.0 / count.sqrt())
+        FixedPoint::from_f64(1.0 / count.powf(0.75))
     }
 
     /// Apply gain dampening to a raw reputation gain.
@@ -455,7 +455,7 @@ mod tests {
     #[test]
     fn gain_dampening_single_node() {
         let identity = Identity::new("root".into());
-        // sqrt(1) = 1.0 — no dampening
+        // 1^0.75 = 1.0 — no dampening
         assert_eq!(identity.gain_dampening(), FixedPoint::ONE);
         assert_eq!(identity.dampen_gain(FixedPoint::from_f64(0.01)).raw(), 100);
     }
@@ -470,13 +470,15 @@ mod tests {
                 linked_at_ms: 1000,
             });
         }
-        // 4 keys: sqrt(4) = 2.0, dampening = 0.5
+        // 4 keys: linear dampening = 1/4 = 0.25
         let dampening = identity.gain_dampening();
-        assert_eq!(dampening.raw(), 5000); // 0.5
+        // 1/4^0.75 = 1/2.8284 ≈ 0.3535
+        assert_eq!(dampening.raw(), 3535);
 
-        let gain = FixedPoint::from_f64(0.02);
+        let gain = FixedPoint::from_f64(0.04);
         let dampened = identity.dampen_gain(gain);
-        assert_eq!(dampened.raw(), 100); // 0.01
+        // 0.04 * 0.3535 ≈ 0.0141
+        assert_eq!(dampened.raw(), 141);
     }
 
     #[test]
@@ -489,9 +491,10 @@ mod tests {
                 linked_at_ms: 1000,
             });
         }
-        // 9 keys: sqrt(9) = 3.0, dampening = 0.3333
+        // 9 keys: linear dampening = 1/9 = 0.1111
         let dampening = identity.gain_dampening();
-        assert_eq!(dampening.raw(), 3333); // 0.3333 (truncated)
+        // 1/9^0.75 = 1/5.1962 ≈ 0.1924
+        assert_eq!(dampening.raw(), 1924);
     }
 
     #[test]
