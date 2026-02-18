@@ -28,7 +28,7 @@ serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 
 # Networking
-libp2p = { version = "0.55", features = ["tokio", "noise", "gossipsub", "mdns", "dns", "tcp", "yamux", "identify", "kad"] }
+libp2p = { version = "0.55", features = ["tokio", "noise", "gossipsub", "mdns", "dns", "tcp", "yamux", "identify", "kad", "macros"] }
 
 # Error handling
 anyhow = "1"

@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use valence_core::constants;
 use valence_core::message::{Envelope, MessageType};
+use valence_crypto::signing::verify_envelope;
 
 /// Sync request per §5.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -103,7 +104,27 @@ pub fn validate_gossip_message(envelope: &Envelope, now_ms: i64) -> GossipValida
         return GossipValidation::PayloadTooLarge;
     }
 
+    // §2: Signature and content address verification.
+    if !verify_envelope(envelope) {
+        return GossipValidation::InvalidSignature;
+    }
+
     GossipValidation::Accept
+}
+
+/// Full gossip validation pipeline: dedup check + message validation.
+/// Use this instead of calling `validate_gossip_message` directly.
+pub fn validate_and_dedup(
+    envelope: &Envelope,
+    now_ms: i64,
+    dedup: &mut crate::transport::DedupCache,
+) -> GossipValidation {
+    // §5: Dedup first (cheapest check).
+    if dedup.check_and_insert(&envelope.id) {
+        return GossipValidation::Duplicate;
+    }
+
+    validate_gossip_message(envelope, now_ms)
 }
 
 /// Message store for the local node. Stores envelopes indexed by (timestamp, id)
@@ -265,7 +286,10 @@ impl AuthChallenge {
 mod tests {
     use super::*;
     use serde_json::json;
+    use valence_crypto::identity::NodeIdentity;
+    use valence_crypto::signing::sign_message;
 
+    /// Make a fake envelope (no valid signature) for store/pagination tests.
     fn make_envelope(id: &str, ts: i64, msg_type: MessageType) -> Envelope {
         Envelope {
             version: 0,
@@ -278,17 +302,30 @@ mod tests {
         }
     }
 
+    /// Make a properly signed envelope for validation tests.
+    fn make_signed_envelope(ts: i64, msg_type: MessageType) -> Envelope {
+        let identity = NodeIdentity::from_seed(&[1u8; 32]);
+        sign_message(&identity, msg_type, json!({"test": true}), ts)
+    }
+
     #[test]
-    fn gossip_validation_accept() {
-        let env = make_envelope("msg1", 1000, MessageType::Propose);
+    fn gossip_validation_accept_signed() {
+        let env = make_signed_envelope(1000, MessageType::Propose);
         assert_eq!(validate_gossip_message(&env, 1000), GossipValidation::Accept);
+    }
+
+    #[test]
+    fn gossip_validation_invalid_signature() {
+        // Fake envelope with bogus signature should fail
+        let env = make_envelope("msg1", 1000, MessageType::Propose);
+        assert_eq!(validate_gossip_message(&env, 1000), GossipValidation::InvalidSignature);
     }
 
     #[test]
     fn gossip_validation_too_old() {
         let old_ts = 0i64;
         let now = constants::GOSSIP_MAX_AGE_MS + 1;
-        let env = make_envelope("msg1", old_ts, MessageType::Propose);
+        let env = make_signed_envelope(old_ts, MessageType::Propose);
         assert_eq!(validate_gossip_message(&env, now), GossipValidation::TooOld);
     }
 
@@ -296,8 +333,38 @@ mod tests {
     fn gossip_validation_future() {
         let future_ts = 1_000_000i64;
         let now = future_ts - constants::TIMESTAMP_TOLERANCE_MS - 1;
-        let env = make_envelope("msg1", future_ts, MessageType::Propose);
+        let env = make_signed_envelope(future_ts, MessageType::Propose);
         assert_eq!(validate_gossip_message(&env, now), GossipValidation::FutureTimestamp);
+    }
+
+    #[test]
+    fn validate_and_dedup_returns_duplicate() {
+        use crate::transport::DedupCache;
+        let env = make_signed_envelope(1000, MessageType::Propose);
+        let mut dedup = DedupCache::new(100);
+
+        // First time: Accept
+        assert_eq!(validate_and_dedup(&env, 1000, &mut dedup), GossipValidation::Accept);
+        // Second time: Duplicate
+        assert_eq!(validate_and_dedup(&env, 1000, &mut dedup), GossipValidation::Duplicate);
+    }
+
+    #[test]
+    fn initial_sync_includes_all() {
+        let mut store = MessageStore::new();
+        store.insert(make_envelope("a", 0, MessageType::Propose));
+        store.insert(make_envelope("b", 1, MessageType::Propose));
+
+        // Initial sync with since_timestamp=0, since_id=None should get everything
+        let resp = store.query(&SyncRequest {
+            since_timestamp: 0,
+            since_id: None,
+            types: vec![],
+            limit: 100,
+        });
+        assert_eq!(resp.messages.len(), 2);
+        assert_eq!(resp.messages[0].id, "a");
+        assert_eq!(resp.messages[1].id, "b");
     }
 
     #[test]
