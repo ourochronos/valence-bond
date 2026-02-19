@@ -4,9 +4,9 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use libp2p::{
-    gossipsub, identify, kad, mdns, noise,
+    gossipsub, identify, kad, mdns, noise, request_response,
     swarm::SwarmEvent,
-    tcp, yamux, PeerId, Swarm, SwarmBuilder,
+    tcp, yamux, PeerId, Swarm, SwarmBuilder, StreamProtocol,
 };
 use libp2p::futures::StreamExt;
 use tokio::sync::mpsc;
@@ -23,6 +23,12 @@ use crate::transport::{
     TOPIC_PEERS, TOPIC_PROPOSALS, TOPIC_VOTES,
 };
 
+/// Auth protocol request/response types for `/valence/auth/1.0.0`.
+pub type AuthBehaviour = request_response::cbor::Behaviour<
+    crate::gossip::AuthChallenge,
+    crate::gossip::AuthResponse,
+>;
+
 /// Composite network behaviour for Valence.
 #[derive(libp2p::swarm::NetworkBehaviour)]
 pub struct ValenceBehaviour {
@@ -30,6 +36,7 @@ pub struct ValenceBehaviour {
     pub mdns: mdns::tokio::Behaviour,
     pub identify: identify::Behaviour,
     pub kad: kad::Behaviour<kad::store::MemoryStore>,
+    pub auth: AuthBehaviour,
 }
 
 /// The main Valence swarm that orchestrates all networking.
@@ -106,11 +113,19 @@ impl ValenceSwarm {
         let store = kad::store::MemoryStore::new(local_peer_id);
         let kad = kad::Behaviour::new(local_peer_id, store);
 
+        // Auth handshake via request-response protocol (§3, F-2)
+        let auth = request_response::cbor::Behaviour::new(
+            [(StreamProtocol::new("/valence/auth/1.0.0"), request_response::ProtocolSupport::Full)],
+            request_response::Config::default()
+                .with_request_timeout(auth::AUTH_TIMEOUT),
+        );
+
         let behaviour = ValenceBehaviour {
             gossipsub,
             mdns,
             identify,
             kad,
+            auth,
         };
 
         // Build swarm with Noise encryption + Yamux multiplexing (§3)
@@ -248,6 +263,11 @@ impl ValenceSwarm {
                 }
             }
 
+            // F-2: Handle auth request-response protocol events
+            SwarmEvent::Behaviour(ValenceBehaviourEvent::Auth(event)) => {
+                self.handle_auth_event(event);
+            }
+
             SwarmEvent::Behaviour(ValenceBehaviourEvent::Identify(
                 identify::Event::Received { peer_id, info, .. },
             )) => {
@@ -280,12 +300,11 @@ impl ValenceSwarm {
                     timestamps.push(now);
                 }
 
-                // H-4: Initiate auth handshake — send challenge
+                // H-4 / F-2: Initiate auth handshake — send challenge via request-response protocol
                 let challenge = auth::create_challenge(&self.identity);
-                self.pending_auth.insert(peer_id, (challenge, Instant::now()));
-                // In a full implementation, the challenge would be sent via
-                // the /valence/auth/1.0.0 stream protocol. For now we track
-                // the pending state and enforce the auth timeout.
+                self.pending_auth.insert(peer_id, (challenge.clone(), Instant::now()));
+                self.swarm.behaviour_mut().auth.send_request(&peer_id, challenge);
+                debug!(peer = %peer_id, "Sent AUTH_CHALLENGE via /valence/auth/1.0.0");
             }
 
             SwarmEvent::ConnectionClosed {
@@ -307,6 +326,51 @@ impl ValenceSwarm {
             _ => {}
         }
         Ok(())
+    }
+
+    /// Handle auth request-response protocol events (F-2).
+    fn handle_auth_event(&mut self, event: request_response::Event<crate::gossip::AuthChallenge, crate::gossip::AuthResponse>) {
+        match event {
+            // We received an auth challenge from a peer — respond with our signed response
+            request_response::Event::Message {
+                peer,
+                message: request_response::Message::Request { request, channel, .. },
+                ..
+            } => {
+                debug!(peer = %peer, "Received AUTH_CHALLENGE, sending response");
+                let response = self.create_auth_response(&request);
+                let _ = self.swarm.behaviour_mut().auth.send_response(channel, response);
+            }
+
+            // We received an auth response to our challenge — verify it
+            request_response::Event::Message {
+                peer,
+                message: request_response::Message::Response { response, .. },
+                ..
+            } => {
+                match self.verify_and_authenticate_peer(peer, &response) {
+                    Ok(node_id) => {
+                        info!(peer = %peer, node_id = %node_id, "Peer authenticated via /valence/auth/1.0.0");
+                    }
+                    Err(e) => {
+                        warn!(peer = %peer, error = %e, "Auth verification failed, disconnecting");
+                        let _ = self.swarm.disconnect_peer_id(peer);
+                    }
+                }
+            }
+
+            request_response::Event::OutboundFailure { peer, error, .. } => {
+                warn!(peer = %peer, error = %error, "Auth outbound failure, disconnecting");
+                self.pending_auth.remove(&peer);
+                let _ = self.swarm.disconnect_peer_id(peer);
+            }
+
+            request_response::Event::InboundFailure { peer, error, .. } => {
+                warn!(peer = %peer, error = %error, "Auth inbound failure");
+            }
+
+            _ => {}
+        }
     }
 
     /// Handle an incoming GossipSub message.
@@ -762,6 +826,63 @@ mod tests {
         let result = alice_swarm.verify_and_authenticate_peer(bob_peer_id, &bob_response);
         assert!(result.is_err(), "Should reject VDF for wrong key");
         assert!(result.unwrap_err().contains("VDF input"));
+    }
+
+    #[tokio::test]
+    async fn auth_handshake_full_flow_between_two_peers() {
+        // F-2: Simulate the full auth flow: Alice challenges Bob, Bob responds, Alice verifies
+        let alice_id = NodeIdentity::generate();
+        let bob_id = NodeIdentity::generate();
+
+        let (mut alice_swarm, _, _) = ValenceSwarm::new(alice_id.clone(), test_config()).unwrap();
+
+        // Bob computes a valid VDF proof
+        let bob_proof = valence_crypto::vdf::compute(&bob_id.public_key_bytes(), 10);
+        let bob_vdf_json = serde_json::json!({
+            "output": hex::encode(&bob_proof.output),
+            "input_data": hex::encode(&bob_proof.input_data),
+            "difficulty": bob_proof.difficulty,
+            "computed_at": bob_proof.computed_at,
+            "checkpoints": bob_proof.checkpoints.iter().map(|cp| serde_json::json!({
+                "iteration": cp.iteration,
+                "hash": hex::encode(&cp.hash),
+            })).collect::<Vec<_>>(),
+        });
+
+        // Step 1: Alice creates a challenge (happens on ConnectionEstablished)
+        let challenge = auth::create_challenge(&alice_id);
+        let bob_peer_id = PeerId::random();
+        alice_swarm.pending_auth.insert(bob_peer_id, (challenge.clone(), Instant::now()));
+
+        // Step 2: Bob receives challenge and creates response (happens in handle_auth_event)
+        let bob_response = auth::create_response(&bob_id, &challenge, bob_vdf_json);
+
+        // Step 3: Alice verifies (happens in handle_auth_event on Response)
+        let result = alice_swarm.verify_and_authenticate_peer(bob_peer_id, &bob_response);
+        assert!(result.is_ok(), "Auth flow should succeed: {:?}", result);
+        assert_eq!(result.unwrap(), bob_id.node_id());
+
+        // Peer should now be authenticated and removed from pending
+        assert!(alice_swarm.authenticated_peers.contains(&bob_peer_id));
+        assert!(!alice_swarm.pending_auth.contains_key(&bob_peer_id));
+        assert_eq!(alice_swarm.authenticated_peer_count(), 1);
+        assert_eq!(alice_swarm.pending_peer_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn auth_timeout_disconnects_unauthenticated_peer() {
+        // F-2: Peers that don't respond within AUTH_TIMEOUT are disconnected
+        let alice_id = NodeIdentity::generate();
+        let (mut alice_swarm, _, _) = ValenceSwarm::new(alice_id.clone(), test_config()).unwrap();
+
+        let peer = PeerId::random();
+        let challenge = auth::create_challenge(&alice_id);
+        // Insert with a timestamp in the past (beyond AUTH_TIMEOUT)
+        alice_swarm.pending_auth.insert(peer, (challenge, Instant::now() - auth::AUTH_TIMEOUT - Duration::from_secs(1)));
+
+        // disconnect_unauthenticated_peers should remove this peer
+        alice_swarm.disconnect_unauthenticated_peers();
+        assert!(!alice_swarm.pending_auth.contains_key(&peer), "Timed-out peer should be removed from pending");
     }
 
     #[tokio::test]

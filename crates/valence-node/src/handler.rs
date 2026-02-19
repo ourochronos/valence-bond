@@ -229,9 +229,9 @@ fn handle_proposal_withdraw(state: &mut NodeState, envelope: &Envelope) {
     };
 
     if let Some(tracker) = state.proposals.get_mut(&target)
-        && tracker.author_id == envelope.from {
+        && state.identity_manager.same_identity(&envelope.from, &tracker.author_id) {
             tracker.withdraw();
-            info!(proposal = %target, "Proposal withdrawn by author");
+            info!(proposal = %target, from = %envelope.from, "Proposal withdrawn by identity member");
         }
 }
 
@@ -1114,6 +1114,79 @@ mod tests {
         let now_ms = chrono::Utc::now().timestamp_millis();
         handle_gossip_message(&mut state, &env, now_ms);
         // Handler should reject (logged as warning) without panicking
+    }
+
+    #[test]
+    fn handle_withdraw_by_same_identity_child_key() {
+        // H-3 / F-1: A child key in the same identity can withdraw a proposal created by the root key
+        let mut state = make_state();
+        let root = NodeIdentity::generate();
+        let child = NodeIdentity::generate();
+
+        // Link child to root via DID_LINK
+        let binding = format!("DID_LINK:{}:{}", root.node_id(), child.node_id());
+        let child_sig = hex::encode(child.sign(binding.as_bytes()));
+        let link_env = make_envelope(&root, MessageType::DidLink, serde_json::json!({
+            "child_key": child.node_id(),
+            "child_signature": child_sig,
+            "label": "device-2",
+        }));
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        handle_gossip_message(&mut state, &link_env, now_ms);
+        assert!(state.identity_manager.same_identity(&root.node_id(), &child.node_id()));
+
+        // Root creates a proposal
+        let mut rep = ReputationState::new();
+        rep.overall = FixedPoint::from_f64(0.5);
+        state.reputations.insert(root.node_id(), rep);
+
+        let propose_env = make_envelope(&root, MessageType::Propose, serde_json::json!({
+            "tier": "standard",
+            "title": "Test proposal",
+            "body": "Testing withdraw by child key",
+        }));
+        handle_gossip_message(&mut state, &propose_env, now_ms);
+        assert!(state.proposals.contains_key(&propose_env.id));
+        let proposal_id = propose_env.id.clone();
+
+        // Child key withdraws the proposal
+        let withdraw_env = make_envelope(&child, MessageType::Withdraw, serde_json::json!({
+            "proposal_id": proposal_id,
+        }));
+        handle_gossip_message(&mut state, &withdraw_env, now_ms);
+
+        // Proposal should be withdrawn
+        assert!(state.proposals[&proposal_id].withdrawn, "Child key should be able to withdraw root's proposal");
+    }
+
+    #[test]
+    fn handle_withdraw_by_unrelated_key_rejected() {
+        // H-3: An unrelated key should NOT be able to withdraw someone else's proposal
+        let mut state = make_state();
+        let author = NodeIdentity::generate();
+        let stranger = NodeIdentity::generate();
+
+        // Author creates a proposal
+        let mut rep = ReputationState::new();
+        rep.overall = FixedPoint::from_f64(0.5);
+        state.reputations.insert(author.node_id(), rep);
+
+        let propose_env = make_envelope(&author, MessageType::Propose, serde_json::json!({
+            "tier": "standard",
+            "title": "Test proposal",
+        }));
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        handle_gossip_message(&mut state, &propose_env, now_ms);
+        let proposal_id = propose_env.id.clone();
+
+        // Stranger tries to withdraw
+        let withdraw_env = make_envelope(&stranger, MessageType::Withdraw, serde_json::json!({
+            "proposal_id": proposal_id,
+        }));
+        handle_gossip_message(&mut state, &withdraw_env, now_ms);
+
+        // Proposal should NOT be withdrawn
+        assert!(!state.proposals[&proposal_id].withdrawn, "Unrelated key should not withdraw proposal");
     }
 
     #[test]
