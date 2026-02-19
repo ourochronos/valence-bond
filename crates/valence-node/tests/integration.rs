@@ -598,3 +598,403 @@ fn test_reputation_capability_ramp() {
     handle_gossip_message(&mut state, &flag_illegal2, now);
     // No panic = accepted
 }
+
+#[test]
+fn test_two_node_content_lifecycle() {
+    use valence_core::message::ErasureCoding;
+    use valence_network::storage::{encode_artifact, generate_challenge, compute_proof, verify_proof};
+    use sha2::Digest;
+
+    // ── Setup: Alice and Bob, both with sufficient reputation ──
+    let alice = NodeIdentity::generate();
+    let bob = NodeIdentity::generate();
+    let alice_id = alice.node_id();
+    let bob_id = bob.node_id();
+    
+    let mut state_alice = NodeState::new();
+    let mut state_bob = NodeState::new();
+    let now = chrono::Utc::now().timestamp_millis();
+
+    // Set reputation to enable all operations
+    set_rep(&mut state_alice, &alice_id, 0.5);
+    set_rep(&mut state_alice, &bob_id, 0.5);
+    set_rep(&mut state_bob, &alice_id, 0.5);
+    set_rep(&mut state_bob, &bob_id, 0.5);
+
+    // ── Step 1: Alice proposes content ──
+    let test_content = b"Integration test content for Valence Network";
+    let content_hash = hex::encode(sha2::Sha256::digest(test_content));
+    
+    // Erasure code the content (Standard = 5+3)
+    let coding = ErasureCoding::Standard;
+    let shards = encode_artifact(test_content, &coding).expect("Failed to encode content");
+    
+    // Build shard metadata
+    let shard_metadata = valence_network::storage::build_shard_metadata(&shards, &coding, &content_hash);
+
+    // Alice broadcasts PROPOSE with shard metadata
+    let propose_env = make_envelope_at(
+        &alice,
+        MessageType::Propose,
+        serde_json::json!({
+            "tier": "standard",
+            "title": "Content Proposal",
+            "body": "Test content for integration",
+            "voting_deadline_ms": now + 7 * 24 * 3600 * 1000,
+            "content_hash": &content_hash,
+            "shard_metadata": serde_json::to_value(&shard_metadata).unwrap(),
+        }),
+        now,
+    );
+    let proposal_id = propose_env.id.clone();
+
+    // Both nodes process the proposal
+    handle_gossip_message(&mut state_alice, &propose_env, now);
+    handle_gossip_message(&mut state_bob, &propose_env, now);
+
+    assert!(state_alice.proposals.contains_key(&proposal_id), "Alice should track the proposal");
+    assert!(state_bob.proposals.contains_key(&proposal_id), "Bob should track the proposal");
+
+    // ── Step 2: Bob votes to endorse ──
+    let vote_bob = make_envelope_at(
+        &bob,
+        MessageType::Vote,
+        serde_json::json!({
+            "proposal_id": &proposal_id,
+            "stance": "endorse",
+        }),
+        now + 1000,
+    );
+    
+    handle_gossip_message(&mut state_alice, &vote_bob, now + 1000);
+    handle_gossip_message(&mut state_bob, &vote_bob, now + 1000);
+
+    // Alice also endorses
+    let vote_alice = make_envelope_at(
+        &alice,
+        MessageType::Vote,
+        serde_json::json!({
+            "proposal_id": &proposal_id,
+            "stance": "endorse",
+        }),
+        now + 2000,
+    );
+    
+    handle_gossip_message(&mut state_alice, &vote_alice, now + 2000);
+    handle_gossip_message(&mut state_bob, &vote_alice, now + 2000);
+
+    // ── Step 3: Proposal passes (2 endorsements meets threshold for small network) ──
+    let tracker_alice = state_alice.proposals.get(&proposal_id).unwrap();
+    let tracker_bob = state_bob.proposals.get(&proposal_id).unwrap();
+    
+    assert_eq!(tracker_alice.votes.len(), 2, "Should have 2 votes on Alice");
+    assert_eq!(tracker_bob.votes.len(), 2, "Should have 2 votes on Bob");
+
+    // ── Step 4: Alice replicates content - sends shards to Bob ──
+    // Simulate REPLICATE_REQUEST from Alice to Bob
+    let replicate_request = make_envelope_at(
+        &alice,
+        MessageType::ReplicateRequest,
+        serde_json::json!({
+            "content_hash": &content_hash,
+            "shard_count": shards.len(),
+            "requester_node": &alice_id,
+        }),
+        now + 3000,
+    );
+    
+    handle_gossip_message(&mut state_bob, &replicate_request, now + 3000);
+
+    // Bob accepts replication
+    let replicate_accept = make_envelope_at(
+        &bob,
+        MessageType::ReplicateAccept,
+        serde_json::json!({
+            "content_hash": &content_hash,
+            "provider_node": &bob_id,
+        }),
+        now + 4000,
+    );
+    
+    handle_gossip_message(&mut state_alice, &replicate_accept, now + 4000);
+
+    // Alice assigns shards to Bob (sending first 5 data shards)
+    for (i, shard) in shards.iter().take(5).enumerate() {
+        let shard_assignment = make_envelope_at(
+            &alice,
+            MessageType::ShardAssignment,
+            serde_json::json!({
+                "content_hash": &content_hash,
+                "shard_index": i,
+                "provider_node": &bob_id,
+                "shard_hash": &shard.hash,
+            }),
+            now + 5000 + (i as i64 * 100),
+        );
+        
+        handle_gossip_message(&mut state_bob, &shard_assignment, now + 5000 + (i as i64 * 100));
+    }
+
+    // ── Step 5: Bob receives and stores shards ──
+    for (i, shard) in shards.iter().take(5).enumerate() {
+        // Simulate Bob storing the shard
+        state_bob.shard_store
+            .store_shard(&content_hash, i as u32, &shard.data)
+            .expect("Failed to store shard");
+        
+        // Bob confirms receipt
+        let shard_received = make_envelope_at(
+            &bob,
+            MessageType::ShardReceived,
+            serde_json::json!({
+                "content_hash": &content_hash,
+                "shard_index": i,
+                "provider_node": &bob_id,
+            }),
+            now + 6000 + (i as i64 * 100),
+        );
+        
+        handle_gossip_message(&mut state_alice, &shard_received, now + 6000 + (i as i64 * 100));
+    }
+
+    // Verify Bob has the shards stored
+    for i in 0..5 {
+        assert!(
+            state_bob.shard_store.has_shard(&content_hash, i),
+            "Bob should have shard {}", i
+        );
+    }
+
+    // ── Step 6: Issue a storage challenge to Bob ──
+    let shard_to_challenge = &shards[0];
+    let challenge = generate_challenge(&shard_to_challenge.hash, shard_to_challenge.data.len(), 32);
+
+    // Simulate Alice sending the challenge via StorageChallenge message
+    let challenge_msg = make_envelope_at(
+        &alice,
+        MessageType::StorageChallenge,
+        serde_json::json!({
+            "content_hash": &content_hash,
+            "shard_hash": &challenge.shard_hash,
+            "offset": challenge.offset,
+            "direction": format!("{:?}", challenge.direction).to_lowercase(),
+            "window_size": challenge.window_size,
+            "challenge_nonce": &challenge.challenge_nonce,
+            "challenger": &alice_id,
+        }),
+        now + 7000,
+    );
+    
+    handle_gossip_message(&mut state_bob, &challenge_msg, now + 7000);
+
+    // ── Step 7: Bob computes and sends proof ──
+    let shard_data = state_bob.shard_store
+        .read_shard(&content_hash, 0)
+        .expect("Failed to read shard for proof");
+    
+    let proof = compute_proof(&challenge, &shard_data).expect("Failed to compute proof");
+
+    // Bob sends proof back to Alice
+    let proof_msg = make_envelope_at(
+        &bob,
+        MessageType::StorageChallenge, // Reusing same message type for proof response
+        serde_json::json!({
+            "content_hash": &content_hash,
+            "shard_hash": &challenge.shard_hash,
+            "proof_hash": &proof.proof_hash,
+            "responder": &bob_id,
+        }),
+        now + 8000,
+    );
+    
+    handle_gossip_message(&mut state_alice, &proof_msg, now + 8000);
+
+    // ── Step 8: Alice verifies the proof ──
+    let alice_shard_data = &shards[0].data;
+    let verification = verify_proof(&challenge, &proof, alice_shard_data)
+        .expect("Failed to verify proof");
+    
+    assert!(verification, "Storage proof should be valid");
+
+    // ── Step 9: Verify end-to-end content flow ──
+    // Alice should have the original content
+    // Bob should have 5 data shards (out of 8 total) that can reconstruct the content
+    let bob_shards: Vec<Option<Vec<u8>>> = (0..8)
+        .map(|i| {
+            if i < 5 {
+                state_bob.shard_store.read_shard(&content_hash, i as u32).ok()
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let reconstructed = valence_network::storage::reconstruct_artifact(
+        &mut bob_shards.clone(),
+        &coding,
+        test_content.len(),
+    ).expect("Failed to reconstruct content");
+
+    assert_eq!(
+        reconstructed, test_content,
+        "Reconstructed content should match original"
+    );
+}
+
+#[test]
+fn test_content_flag_and_quarantine() {
+    use valence_core::message::ErasureCoding;
+    use valence_network::storage::encode_artifact;
+    use valence_network::shard_store::ShardStore;
+    use sha2::Digest;
+
+    // ── Setup: Alice and Bob with shared content ──
+    let alice = NodeIdentity::generate();
+    let bob = NodeIdentity::generate();
+    let alice_id = alice.node_id();
+    let bob_id = bob.node_id();
+    
+    // Create separate shard stores for Alice and Bob using temp dirs
+    let alice_dir = std::env::temp_dir().join(format!("alice_{}", alice_id));
+    let bob_dir = std::env::temp_dir().join(format!("bob_{}", bob_id));
+    
+    let mut state_alice = NodeState::new();
+    let mut state_bob = NodeState::new();
+    
+    // Override shard stores with separate directories
+    state_alice.shard_store = ShardStore::new(alice_dir.clone()).expect("Failed to create Alice's shard store");
+    state_bob.shard_store = ShardStore::new(bob_dir.clone()).expect("Failed to create Bob's shard store");
+    
+    let now = chrono::Utc::now().timestamp_millis();
+
+    // Set reputation
+    set_rep(&mut state_alice, &alice_id, 0.5);
+    set_rep(&mut state_alice, &bob_id, 0.5);
+    set_rep(&mut state_bob, &alice_id, 0.5);
+    set_rep(&mut state_bob, &bob_id, 0.5);
+
+    // ── Step 1: Create and share content ──
+    let test_content = b"Content that will be flagged";
+    let content_hash = hex::encode(sha2::Sha256::digest(test_content));
+    
+    let coding = ErasureCoding::Standard;
+    let shards = encode_artifact(test_content, &coding).expect("Failed to encode");
+
+    // Share content
+    let share_env = make_envelope_at(
+        &alice,
+        MessageType::Share,
+        serde_json::json!({
+            "entries": [{
+                "content_hash": &content_hash,
+                "content_type": "text/plain",
+                "content_size": test_content.len(),
+                "tags": ["test"]
+            }]
+        }),
+        now,
+    );
+    
+    handle_gossip_message(&mut state_bob, &share_env, now);
+
+    // ── Step 2: Both nodes store shards ──
+    for (i, shard) in shards.iter().enumerate() {
+        state_alice.shard_store
+            .store_shard(&content_hash, i as u32, &shard.data)
+            .expect("Alice failed to store shard");
+        
+        state_bob.shard_store
+            .store_shard(&content_hash, i as u32, &shard.data)
+            .expect("Bob failed to store shard");
+    }
+
+    // Verify both have the content
+    assert!(state_alice.shard_store.has_shard(&content_hash, 0), "Alice should have shard 0");
+    assert!(state_bob.shard_store.has_shard(&content_hash, 0), "Bob should have shard 0");
+
+    // ── Step 3: Bob flags the content ──
+    let flag_env = make_envelope_at(
+        &bob,
+        MessageType::Flag,
+        serde_json::json!({
+            "content_hash": &content_hash,
+            "severity": "dispute",
+            "category": "spam",
+            "details": "This content violates network guidelines",
+            "flagger": &bob_id,
+        }),
+        now + 1000,
+    );
+    
+    // Bob processes his own flag — this automatically quarantines on Bob's node
+    handle_gossip_message(&mut state_bob, &flag_env, now + 1000);
+    
+    // ── Step 4: Verify Bob quarantined the content ──
+    assert!(
+        !state_bob.shard_store.has_shard(&content_hash, 0),
+        "Bob should no longer have shard 0 in main storage after flagging"
+    );
+    
+    // Verify quarantine size increased on Bob's node
+    assert!(
+        state_bob.shard_store.quarantine_size() > 0,
+        "Bob's quarantine should contain data"
+    );
+
+    // ── Step 5: Alice receives the flag and also quarantines ──
+    // Note: handle_flag automatically quarantines flagged content on receiving node
+    handle_gossip_message(&mut state_alice, &flag_env, now + 1000);
+    
+    // Verify Alice also quarantined (this is network protocol behavior)
+    assert!(
+        !state_alice.shard_store.has_shard(&content_hash, 0),
+        "Alice should also quarantine after receiving FLAG message"
+    );
+    
+    assert!(
+        state_alice.shard_store.quarantine_size() > 0,
+        "Alice's quarantine should contain data"
+    );
+
+    // ── Step 6: Verify storage statistics for both nodes ──
+    let alice_stats = state_alice.shard_store.stats();
+    let bob_stats = state_bob.shard_store.stats();
+
+    // Both nodes should have quarantined the content
+    assert_eq!(alice_stats.shard_count, 0, "Alice should have 0 shards in main storage");
+    assert!(alice_stats.quarantine_bytes > 0, "Alice should have quarantined data");
+    
+    assert_eq!(bob_stats.shard_count, 0, "Bob should have 0 shards in main storage");
+    assert!(bob_stats.quarantine_bytes > 0, "Bob should have quarantined data");
+
+    // ── Step 7: Each node can independently delete quarantined content ──
+    // Bob deletes his quarantined content
+    state_bob.shard_store
+        .delete_quarantined(&content_hash)
+        .expect("Failed to delete quarantined content");
+    
+    assert_eq!(
+        state_bob.shard_store.quarantine_size(), 0,
+        "Bob's quarantine should be empty after deletion"
+    );
+    
+    // Alice still has hers (independent storage)
+    assert!(
+        state_alice.shard_store.quarantine_size() > 0,
+        "Alice should still have quarantined data"
+    );
+    
+    // Alice can also delete later
+    state_alice.shard_store
+        .delete_quarantined(&content_hash)
+        .expect("Failed to delete Alice's quarantined content");
+    
+    assert_eq!(
+        state_alice.shard_store.quarantine_size(), 0,
+        "Alice's quarantine should now be empty"
+    );
+    
+    // Cleanup temp directories
+    let _ = std::fs::remove_dir_all(&alice_dir);
+    let _ = std::fs::remove_dir_all(&bob_dir);
+}
