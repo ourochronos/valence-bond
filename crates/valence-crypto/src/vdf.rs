@@ -6,6 +6,7 @@
 //!   output = h[difficulty]
 //!   checkpoint[k] = h[k × checkpoint_interval]
 
+use rand::seq::SliceRandom;
 use sha2::{Digest, Sha256};
 use valence_core::constants::{VDF_CHECKPOINT_INTERVAL, VDF_DIFFICULTY};
 
@@ -108,12 +109,18 @@ pub fn verify(proof: &VdfProof, min_segments: usize) -> Result<(), String> {
     // Verify input_data matches (caller should check this is the node's public key)
     let h0 = Sha256::digest(&proof.input_data).to_vec();
 
-    // Select segments to verify (for full verification, check all; for spot-check, select randomly)
-    // In this implementation, verify the first `min_segments` segments
-    let segments_to_verify = min_segments.min(proof.checkpoints.len());
+    // L-1: Randomly select segments to verify (not just the first N).
+    // This prevents attackers from computing only the first segments honestly.
+    let mut segment_indices: Vec<usize> = (0..proof.checkpoints.len()).collect();
+    {
+        let mut rng = rand::thread_rng();
+        segment_indices.shuffle(&mut rng);
+    }
+    segment_indices.truncate(min_segments);
+    segment_indices.sort(); // Sort for sequential access efficiency
 
-    // Verify segments
-    for seg_idx in 0..segments_to_verify {
+    // Verify selected segments
+    for &seg_idx in &segment_indices {
         let start_hash = if seg_idx == 0 {
             &h0
         } else {
@@ -147,11 +154,10 @@ pub fn verify(proof: &VdfProof, min_segments: usize) -> Result<(), String> {
     }
 
     // Verify output matches last checkpoint (if difficulty aligns with checkpoint interval)
-    if let Some(last) = proof.checkpoints.last() {
-        if last.iteration == proof.difficulty && last.hash != proof.output {
+    if let Some(last) = proof.checkpoints.last()
+        && last.iteration == proof.difficulty && last.hash != proof.output {
             return Err("Output doesn't match last checkpoint".to_string());
         }
-    }
 
     Ok(())
 }
@@ -206,7 +212,8 @@ mod tests {
         if let Some(cp) = proof.checkpoints.get_mut(3) {
             cp.hash[0] ^= 0xff;
         }
-        assert!(verify(&proof, 5).is_err());
+        // Verify all segments to deterministically catch the tampered checkpoint
+        assert!(verify(&proof, 10).is_err());
     }
 
     #[test]
@@ -229,6 +236,23 @@ mod tests {
         let result = verify(&proof, 5);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("future"));
+    }
+
+    // ── L-1: Random segment verification ──
+
+    #[test]
+    fn vdf_verify_catches_tampering_in_later_segments() {
+        // L-1: Tamper with a later segment (not the first few) — random
+        // sampling should eventually catch it
+        let input = b"test_public_key_bytes_here_32byt";
+        let mut proof = compute(input, 10);
+        // Tamper with the last checkpoint
+        if let Some(cp) = proof.checkpoints.last_mut() {
+            cp.hash[0] ^= 0xff;
+        }
+        // Verify with enough segments to cover all checkpoints
+        let result = verify(&proof, 10);
+        assert!(result.is_err(), "Tampering in last segment should be caught");
     }
 
     #[test]

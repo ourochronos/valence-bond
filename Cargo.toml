@@ -45,6 +45,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 hex = "0.4"
 
+# Encoding
+base64 = "0.22"
+
+# System
+libc = "0.2"
+
 # Erasure coding
 reed-solomon-erasure = "6"
 

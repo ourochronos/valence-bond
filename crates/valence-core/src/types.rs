@@ -13,9 +13,17 @@ impl FixedPoint {
     pub const ZERO: Self = Self(0);
     pub const ONE: Self = Self(10_000);
 
-    /// Create from float, truncating (not rounding) per §2.
+    /// Create from float, truncating toward zero (not rounding) per §2.
+    /// L-5: For negative values, truncation is toward zero (e.g., -0.67891 → -6789).
+    /// This matches Rust's default `as i64` cast behavior.
     pub fn from_f64(val: f64) -> Self {
         Self((val * Self::SCALE as f64) as i64)
+    }
+
+    /// Create from float, flooring toward negative infinity.
+    /// Use when floor semantics are needed for negative values.
+    pub fn from_f64_floor(val: f64) -> Self {
+        Self((val * Self::SCALE as f64).floor() as i64)
     }
 
     /// Create from raw scaled integer.
@@ -45,14 +53,29 @@ impl FixedPoint {
 
     /// Multiply two fixed-point values. Intermediate uses i128 to avoid overflow.
     /// Truncation only on final result per §2/§8.
+    #[allow(clippy::should_implement_trait)]
     pub fn mul(self, other: Self) -> Self {
         let result = (self.0 as i128 * other.0 as i128) / Self::SCALE as i128;
         Self(result as i64)
     }
 
     /// Divide two fixed-point values. Intermediate uses i128.
+    /// M-4: Returns None on division by zero instead of silently returning ZERO.
+    pub fn checked_div(self, other: Self) -> Option<Self> {
+        if other.0 == 0 {
+            return None;
+        }
+        let result = (self.0 as i128 * Self::SCALE as i128) / other.0 as i128;
+        Some(Self(result as i64))
+    }
+
+    /// Divide two fixed-point values. Intermediate uses i128.
+    /// Logs a warning on division by zero and returns ZERO (M-4).
+    #[allow(clippy::should_implement_trait)]
     pub fn div(self, other: Self) -> Self {
         if other.0 == 0 {
+            #[cfg(debug_assertions)]
+            eprintln!("WARNING: FixedPoint::div called with zero divisor, returning ZERO");
             return Self::ZERO;
         }
         let result = (self.0 as i128 * Self::SCALE as i128) / other.0 as i128;
@@ -393,6 +416,39 @@ mod tests {
         let b = FixedPoint::from_f64(0.3);
         let result = a.div(b);
         assert_eq!(result.raw(), 20000); // 0.6 / 0.3 = 2.0
+    }
+
+    // ── M-4: checked_div returns None on zero ──
+
+    #[test]
+    fn fixed_point_checked_div_zero_returns_none() {
+        let a = FixedPoint::from_f64(1.0);
+        assert_eq!(a.checked_div(FixedPoint::ZERO), None);
+    }
+
+    #[test]
+    fn fixed_point_checked_div_normal() {
+        let a = FixedPoint::from_f64(0.6);
+        let b = FixedPoint::from_f64(0.3);
+        let result = a.checked_div(b).unwrap();
+        assert_eq!(result.raw(), 20000); // 2.0
+    }
+
+    // ── L-5: from_f64_floor for negative values ──
+
+    #[test]
+    fn fixed_point_from_f64_truncates_toward_zero_for_negatives() {
+        // L-5: Document that from_f64 truncates toward zero
+        assert_eq!(FixedPoint::from_f64(-0.67891).raw(), -6789);
+        assert_eq!(FixedPoint::from_f64(-1.5).raw(), -15000);
+    }
+
+    #[test]
+    fn fixed_point_from_f64_floor_floors_toward_neg_infinity() {
+        // L-5: from_f64_floor uses floor semantics
+        assert_eq!(FixedPoint::from_f64_floor(-0.67891).raw(), -6790);
+        assert_eq!(FixedPoint::from_f64_floor(-1.5).raw(), -15000); // -1.5 floors to -1.5 exactly
+        assert_eq!(FixedPoint::from_f64_floor(0.67891).raw(), 6789); // positive same as truncate
     }
 
     #[test]
