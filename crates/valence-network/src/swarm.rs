@@ -29,6 +29,18 @@ pub type AuthBehaviour = request_response::cbor::Behaviour<
     crate::gossip::AuthResponse,
 >;
 
+/// Content protocol request/response types for `/valence/content/1.0.0`.
+pub type ContentBehaviour = request_response::cbor::Behaviour<
+    crate::transport::ContentStreamMessage,
+    ContentAck,
+>;
+
+/// Simple acknowledgment for content protocol messages.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ContentAck {
+    pub success: bool,
+}
+
 /// Composite network behaviour for Valence.
 #[derive(libp2p::swarm::NetworkBehaviour)]
 pub struct ValenceBehaviour {
@@ -37,6 +49,7 @@ pub struct ValenceBehaviour {
     pub identify: identify::Behaviour,
     pub kad: kad::Behaviour<kad::store::MemoryStore>,
     pub auth: AuthBehaviour,
+    pub content: ContentBehaviour,
 }
 
 /// The main Valence swarm that orchestrates all networking.
@@ -58,6 +71,8 @@ pub struct ValenceSwarm {
     config: TransportConfig,
     /// VDF proof for this node, included in auth handshake and PEER_ANNOUNCE.
     vdf_proof: serde_json::Value,
+    /// Start time for uptime tracking.
+    start_time: Instant,
 }
 
 /// Maximum new connections per IP per minute (H-7).
@@ -120,12 +135,19 @@ impl ValenceSwarm {
                 .with_request_timeout(auth::AUTH_TIMEOUT),
         );
 
+        // Content stream protocol for shard transfer and storage proofs (§6)
+        let content = request_response::cbor::Behaviour::new(
+            [(StreamProtocol::new("/valence/content/1.0.0"), request_response::ProtocolSupport::Full)],
+            request_response::Config::default(),
+        );
+
         let behaviour = ValenceBehaviour {
             gossipsub,
             mdns,
             identify,
             kad,
             auth,
+            content,
         };
 
         // Build swarm with Noise encryption + Yamux multiplexing (§3)
@@ -163,6 +185,7 @@ impl ValenceSwarm {
             prune_interval,
             config,
             vdf_proof: serde_json::json!({}),
+            start_time: Instant::now(),
         };
 
         Ok((swarm_instance, command_tx, event_rx))
@@ -266,6 +289,11 @@ impl ValenceSwarm {
             // F-2: Handle auth request-response protocol events
             SwarmEvent::Behaviour(ValenceBehaviourEvent::Auth(event)) => {
                 self.handle_auth_event(event);
+            }
+
+            // Handle content stream protocol events (§6)
+            SwarmEvent::Behaviour(ValenceBehaviourEvent::Content(event)) => {
+                self.handle_content_event(event);
             }
 
             SwarmEvent::Behaviour(ValenceBehaviourEvent::Identify(
@@ -373,6 +401,82 @@ impl ValenceSwarm {
         }
     }
 
+    /// Handle content stream protocol events (§6).
+    fn handle_content_event(&mut self, event: request_response::Event<crate::transport::ContentStreamMessage, ContentAck>) {
+        use crate::transport::ContentStreamMessage;
+
+        match event {
+            // Incoming content request
+            request_response::Event::Message {
+                peer,
+                message: request_response::Message::Request { request, channel, .. },
+                ..
+            } => {
+                debug!(peer = %peer, "Received content stream request");
+                
+                // Emit appropriate transport event based on message type
+                match request {
+                    ContentStreamMessage::ShardTransfer { content_hash, shard_index, shard_data } => {
+                        let _ = self.event_tx.send(TransportEvent::ContentReceived {
+                            peer_id: peer,
+                            content_hash,
+                            shard_index,
+                            shard_data,
+                        });
+                    }
+                    ContentStreamMessage::StorageChallenge { .. } => {
+                        // TODO: Parse and emit StorageChallengeReceived event
+                        debug!(peer = %peer, "Received storage challenge (not yet implemented)");
+                    }
+                    ContentStreamMessage::StorageProof { proof_hash } => {
+                        let _ = self.event_tx.send(TransportEvent::StorageProofReceived {
+                            peer_id: peer,
+                            proof: crate::storage::StorageProof { proof_hash },
+                        });
+                    }
+                    ContentStreamMessage::ContentRequest { content_hash, offset, length } => {
+                        let _ = self.event_tx.send(TransportEvent::ContentRequested {
+                            peer_id: peer,
+                            content_hash,
+                            offset,
+                            length,
+                        });
+                    }
+                    ContentStreamMessage::ContentResponse { .. } => {
+                        debug!(peer = %peer, "Received content response");
+                    }
+                }
+
+                // Send ack
+                let ack = ContentAck { success: true };
+                let _ = self.swarm.behaviour_mut().content.send_response(channel, ack);
+            }
+
+            // Response to our content request
+            request_response::Event::Message {
+                peer,
+                message: request_response::Message::Response { response, .. },
+                ..
+            } => {
+                if response.success {
+                    debug!(peer = %peer, "Content stream request acknowledged");
+                } else {
+                    warn!(peer = %peer, "Content stream request failed");
+                }
+            }
+
+            request_response::Event::OutboundFailure { peer, error, .. } => {
+                warn!(peer = %peer, error = %error, "Content outbound failure");
+            }
+
+            request_response::Event::InboundFailure { peer, error, .. } => {
+                warn!(peer = %peer, error = %error, "Content inbound failure");
+            }
+
+            _ => {}
+        }
+    }
+
     /// Handle an incoming GossipSub message.
     fn handle_gossipsub_message(
         &mut self,
@@ -442,40 +546,20 @@ impl ValenceSwarm {
                 shard_index,
                 shard_data,
             } => {
-                // Encode as a content stream frame and publish on the content protocol.
-                // In a full implementation this would open a stream to the peer via
-                // /valence/content/1.0.0; for now we serialize the frame for the swarm
-                // to deliver when stream protocol support is wired in.
                 let msg = crate::transport::ContentStreamMessage::ShardTransfer {
                     content_hash,
                     shard_index,
                     shard_data,
                 };
-                match crate::transport::encode_content_frame(&msg) {
-                    Ok(frame) => {
-                        debug!(peer = %peer_id, frame_len = frame.len(), "Encoded SendShard frame");
-                        // TODO: Send frame via /valence/content/1.0.0 stream to peer_id
-                        // For now, emit a log. The stream protocol negotiation will be
-                        // wired in a future phase.
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "Failed to encode SendShard frame");
-                    }
-                }
+                self.swarm.behaviour_mut().content.send_request(&peer_id, msg);
+                debug!(peer = %peer_id, "Sent shard transfer via /valence/content/1.0.0");
             }
             TransportCommand::SendStorageProof { peer_id, proof } => {
                 let msg = crate::transport::ContentStreamMessage::StorageProof {
                     proof_hash: proof.proof_hash,
                 };
-                match crate::transport::encode_content_frame(&msg) {
-                    Ok(frame) => {
-                        debug!(peer = %peer_id, frame_len = frame.len(), "Encoded SendStorageProof frame");
-                        // TODO: Send frame via /valence/content/1.0.0 stream to peer_id
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "Failed to encode SendStorageProof frame");
-                    }
-                }
+                self.swarm.behaviour_mut().content.send_request(&peer_id, msg);
+                debug!(peer = %peer_id, "Sent storage proof via /valence/content/1.0.0");
             }
         }
         Ok(())
@@ -492,7 +576,7 @@ impl ValenceSwarm {
             addresses: addrs,
             capabilities: vec!["propose".into(), "vote".into(), "store".into()],
             version: 0,
-            uptime_seconds: 0, // TODO: Track actual uptime
+            uptime_seconds: self.start_time.elapsed().as_secs(),
             vdf_proof: self.vdf_proof.clone(),
             storage: None, // TODO: Report actual storage capacity
             sync_status: Some("synced".into()), // TODO: Track actual sync status

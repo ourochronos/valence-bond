@@ -306,12 +306,14 @@ async fn cmd_run(
     let api_config = ApiConfig {
         bind_addr: format!("127.0.0.1:{api_port}").parse().unwrap(),
     };
+    let peer_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let api_state = Arc::new(ApiState {
         node_state: node_state.clone(),
         identity: identity.clone(),
         command_tx: cmd_tx.clone(),
         started_at: chrono::Utc::now(),
         api_token,
+        peer_count: peer_count.clone(),
     });
     api::start_api_server(api_config, api_state).await?;
 
@@ -381,9 +383,11 @@ async fn cmd_run(
                     }
                     TransportEvent::PeerConnected { peer_id, node_id, .. } => {
                         info!(peer = %peer_id, node = %node_id, "Peer connected");
+                        peer_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                     TransportEvent::PeerDisconnected { peer_id } => {
                         info!(peer = %peer_id, "Peer disconnected");
+                        peer_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                     }
                     _ => {
                         // SyncResponse, ContentReceived, StorageChallenge, etc.

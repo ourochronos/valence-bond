@@ -44,6 +44,8 @@ pub struct ApiState {
     pub started_at: chrono::DateTime<chrono::Utc>,
     /// Bearer token for API authentication (C-4).
     pub api_token: String,
+    /// Current authenticated peer count.
+    pub peer_count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Generate a random API token (64 hex characters = 32 bytes of entropy).
@@ -195,7 +197,7 @@ pub async fn handle_status(api_state: &ApiState) -> ApiResponse<StatusResponse> 
     ApiResponse::success(StatusResponse {
         node_id: api_state.identity.node_id().to_string(),
         uptime_seconds: uptime,
-        peer_count: 0, // TODO: Wire to PeerTable
+        peer_count: api_state.peer_count.load(std::sync::atomic::Ordering::Relaxed),
         proposal_count: state.proposals.len(),
         identity_count: state.identity_manager.identity_count(),
     })
@@ -563,6 +565,7 @@ mod tests {
             command_tx: cmd_tx,
             started_at: chrono::Utc::now(),
             api_token: "test-token-12345".to_string(),
+            peer_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
     }
 
