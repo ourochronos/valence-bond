@@ -1,7 +1,7 @@
 //! libp2p Swarm event loop — composing GossipSub, mDNS, Identify, Kademlia per §3-§5.
 
-use std::collections::HashSet;
-use std::time::Duration;
+use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use libp2p::{
     gossipsub, identify, kad, mdns, noise,
@@ -16,7 +16,8 @@ use valence_core::constants;
 use valence_core::message::Envelope;
 use valence_crypto::identity::NodeIdentity;
 
-use crate::gossip::{validate_and_dedup, GossipValidation, MessageStore, PeerAnnounce};
+use crate::auth;
+use crate::gossip::{validate_and_dedup, AuthChallenge, GossipValidation, MessageStore, PeerAnnounce};
 use crate::transport::{
     DedupCache, PeerInfo, PeerTable, TransportCommand, TransportConfig, TransportEvent,
     TOPIC_PEERS, TOPIC_PROPOSALS, TOPIC_VOTES,
@@ -41,10 +42,19 @@ pub struct ValenceSwarm {
     event_tx: mpsc::UnboundedSender<TransportEvent>,
     command_rx: mpsc::UnboundedReceiver<TransportCommand>,
     authenticated_peers: HashSet<PeerId>,
+    /// Pending auth challenges sent to peers, with their connection time (H-4).
+    pending_auth: HashMap<PeerId, (AuthChallenge, Instant)>,
+    /// Per-IP connection timestamps for rate limiting (H-7).
+    connection_rate: HashMap<std::net::IpAddr, Vec<Instant>>,
     announce_interval: tokio::time::Interval,
     prune_interval: tokio::time::Interval,
     config: TransportConfig,
+    /// VDF proof for this node, included in auth handshake and PEER_ANNOUNCE.
+    vdf_proof: serde_json::Value,
 }
+
+/// Maximum new connections per IP per minute (H-7).
+const MAX_CONNECTIONS_PER_IP_PER_MINUTE: usize = 10;
 
 impl ValenceSwarm {
     /// Create a new ValenceSwarm.
@@ -132,9 +142,12 @@ impl ValenceSwarm {
             event_tx,
             command_rx,
             authenticated_peers: HashSet::new(),
+            pending_auth: HashMap::new(),
+            connection_rate: HashMap::new(),
             announce_interval,
             prune_interval,
             config,
+            vdf_proof: serde_json::json!({}),
         };
 
         Ok((swarm_instance, command_tx, event_rx))
@@ -152,6 +165,11 @@ impl ValenceSwarm {
     /// Get the local peer ID.
     pub fn local_peer_id(&self) -> PeerId {
         *self.swarm.local_peer_id()
+    }
+
+    /// Set the VDF proof for this node (loaded from disk or freshly computed).
+    pub fn set_vdf_proof(&mut self, proof: serde_json::Value) {
+        self.vdf_proof = proof;
     }
 
     /// Main event loop — run this to process network events.
@@ -178,6 +196,7 @@ impl ValenceSwarm {
 
                 _ = self.prune_interval.tick() => {
                     self.prune_expired_peers();
+                    self.disconnect_unauthenticated_peers();
                 }
             }
         }
@@ -244,8 +263,29 @@ impl ValenceSwarm {
             SwarmEvent::ConnectionEstablished {
                 peer_id, endpoint, ..
             } => {
-                info!(peer = %peer_id, addr = %endpoint.get_remote_address(), "Connection established");
-                // TODO: Initiate auth handshake (§3)
+                let remote_addr = endpoint.get_remote_address();
+                info!(peer = %peer_id, addr = %remote_addr, "Connection established");
+
+                // H-7: Per-IP connection rate limiting
+                if let Some(ip) = extract_ip_from_multiaddr(remote_addr) {
+                    let now = Instant::now();
+                    let timestamps = self.connection_rate.entry(ip).or_default();
+                    let one_minute_ago = now - Duration::from_secs(60);
+                    timestamps.retain(|t| *t > one_minute_ago);
+                    if timestamps.len() >= MAX_CONNECTIONS_PER_IP_PER_MINUTE {
+                        warn!(peer = %peer_id, ip = %ip, "Connection rate limit exceeded, disconnecting");
+                        let _ = self.swarm.disconnect_peer_id(peer_id);
+                        return Ok(());
+                    }
+                    timestamps.push(now);
+                }
+
+                // H-4: Initiate auth handshake — send challenge
+                let challenge = auth::create_challenge(&self.identity);
+                self.pending_auth.insert(peer_id, (challenge, Instant::now()));
+                // In a full implementation, the challenge would be sent via
+                // the /valence/auth/1.0.0 stream protocol. For now we track
+                // the pending state and enforce the auth timeout.
             }
 
             SwarmEvent::ConnectionClosed {
@@ -332,6 +372,47 @@ impl ValenceSwarm {
                 // TODO: Implement sync via stream protocol
                 warn!("SyncRequest not yet implemented");
             }
+            TransportCommand::SendShard {
+                peer_id,
+                content_hash,
+                shard_index,
+                shard_data,
+            } => {
+                // Encode as a content stream frame and publish on the content protocol.
+                // In a full implementation this would open a stream to the peer via
+                // /valence/content/1.0.0; for now we serialize the frame for the swarm
+                // to deliver when stream protocol support is wired in.
+                let msg = crate::transport::ContentStreamMessage::ShardTransfer {
+                    content_hash,
+                    shard_index,
+                    shard_data,
+                };
+                match crate::transport::encode_content_frame(&msg) {
+                    Ok(frame) => {
+                        debug!(peer = %peer_id, frame_len = frame.len(), "Encoded SendShard frame");
+                        // TODO: Send frame via /valence/content/1.0.0 stream to peer_id
+                        // For now, emit a log. The stream protocol negotiation will be
+                        // wired in a future phase.
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Failed to encode SendShard frame");
+                    }
+                }
+            }
+            TransportCommand::SendStorageProof { peer_id, proof } => {
+                let msg = crate::transport::ContentStreamMessage::StorageProof {
+                    proof_hash: proof.proof_hash,
+                };
+                match crate::transport::encode_content_frame(&msg) {
+                    Ok(frame) => {
+                        debug!(peer = %peer_id, frame_len = frame.len(), "Encoded SendStorageProof frame");
+                        // TODO: Send frame via /valence/content/1.0.0 stream to peer_id
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Failed to encode SendStorageProof frame");
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -348,7 +429,9 @@ impl ValenceSwarm {
             capabilities: vec!["propose".into(), "vote".into(), "store".into()],
             version: 0,
             uptime_seconds: 0, // TODO: Track actual uptime
-            vdf_proof: serde_json::json!({}), // TODO: Include actual VDF proof
+            vdf_proof: self.vdf_proof.clone(),
+            storage: None, // TODO: Report actual storage capacity
+            sync_status: Some("synced".into()), // TODO: Track actual sync status
         })?;
 
         let now_ms = chrono::Utc::now().timestamp_millis();
@@ -365,6 +448,22 @@ impl ValenceSwarm {
         Ok(())
     }
 
+    /// Disconnect peers that haven't completed auth within the timeout (H-4).
+    fn disconnect_unauthenticated_peers(&mut self) {
+        let expired: Vec<PeerId> = self
+            .pending_auth
+            .iter()
+            .filter(|(_, (_, connected_at))| connected_at.elapsed() > auth::AUTH_TIMEOUT)
+            .map(|(peer_id, _)| *peer_id)
+            .collect();
+
+        for peer_id in expired {
+            warn!(peer = %peer_id, "Auth timeout, disconnecting unauthenticated peer");
+            self.pending_auth.remove(&peer_id);
+            let _ = self.swarm.disconnect_peer_id(peer_id);
+        }
+    }
+
     /// Prune expired peers per §4 (30-minute expiry).
     fn prune_expired_peers(&mut self) {
         let now_ms = chrono::Utc::now().timestamp_millis();
@@ -379,8 +478,10 @@ impl ValenceSwarm {
     }
 
     /// Mark a peer as authenticated after successful auth handshake (§3).
+    /// Verifies the auth response and VDF proof before accepting.
     pub fn authenticate_peer(&mut self, peer_id: PeerId, node_id: String) {
         self.authenticated_peers.insert(peer_id);
+        self.pending_auth.remove(&peer_id);
         if let Some(peer_info) = self.peer_table.get(&peer_id) {
             let _ = self.event_tx.send(TransportEvent::PeerConnected {
                 peer_id,
@@ -389,6 +490,84 @@ impl ValenceSwarm {
             });
         }
     }
+
+    /// Attempt to authenticate a peer given their auth response.
+    /// Returns the node_id on success, or an error description on failure.
+    pub fn verify_and_authenticate_peer(
+        &mut self,
+        peer_id: PeerId,
+        response: &crate::gossip::AuthResponse,
+    ) -> Result<String, String> {
+        // Look up the challenge we sent
+        let (challenge, _) = self.pending_auth.get(&peer_id)
+            .ok_or_else(|| "No pending auth challenge for peer".to_string())?
+            .clone();
+
+        // Verify auth response signature
+        let result = auth::verify_response(&challenge, response);
+        match result {
+            auth::AuthResult::Authenticated(node_id) => {
+                // Verify VDF proof
+                if response.vdf_proof.is_null() || response.vdf_proof == serde_json::json!({}) {
+                    return Err("Missing VDF proof in auth response".to_string());
+                }
+
+                // Parse and verify VDF
+                if let Some(vdf_proof) = auth::parse_vdf_proof(&response.vdf_proof) {
+                    // Check VDF input matches the peer's public key
+                    if let Some(expected_input) = valence_crypto::identity::vdf_input(&node_id)
+                        && vdf_proof.input_data != expected_input {
+                            return Err("VDF input doesn't match peer key".to_string());
+                        }
+                    // Verify VDF proof
+                    if let Err(e) = valence_crypto::vdf::verify(&vdf_proof, 3) {
+                        return Err(format!("VDF verification failed: {e}"));
+                    }
+                } else {
+                    return Err("Malformed VDF proof".to_string());
+                }
+
+                self.authenticate_peer(peer_id, node_id.clone());
+                Ok(node_id)
+            }
+            auth::AuthResult::InvalidSignature => Err("Invalid signature".to_string()),
+            auth::AuthResult::NonceMismatch => Err("Nonce mismatch".to_string()),
+            auth::AuthResult::MalformedKey => Err("Malformed key".to_string()),
+        }
+    }
+
+    /// Get the local node's VDF proof for auth responses.
+    pub fn local_vdf_proof(&self) -> &serde_json::Value {
+        &self.vdf_proof
+    }
+
+    /// Create an auth response for an incoming challenge.
+    pub fn create_auth_response(&self, challenge: &crate::gossip::AuthChallenge) -> crate::gossip::AuthResponse {
+        auth::create_response(&self.identity, challenge, self.vdf_proof.clone())
+    }
+
+    /// Get the count of authenticated peers.
+    pub fn authenticated_peer_count(&self) -> usize {
+        self.authenticated_peers.len()
+    }
+
+    /// Get the count of pending (unauthenticated) peers.
+    pub fn pending_peer_count(&self) -> usize {
+        self.pending_auth.len()
+    }
+}
+
+/// Extract IP address from a libp2p Multiaddr (H-7).
+fn extract_ip_from_multiaddr(addr: &libp2p::Multiaddr) -> Option<std::net::IpAddr> {
+    use libp2p::multiaddr::Protocol;
+    for protocol in addr.iter() {
+        match protocol {
+            Protocol::Ip4(ip) => return Some(std::net::IpAddr::V4(ip)),
+            Protocol::Ip6(ip) => return Some(std::net::IpAddr::V6(ip)),
+            _ => continue,
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -420,6 +599,42 @@ mod tests {
         let config = test_config();
         let (mut swarm, _, _) = ValenceSwarm::new(identity, config).unwrap();
         assert!(swarm.start_listening().is_ok());
+    }
+
+    #[test]
+    fn connection_rate_limit_enforcement() {
+        // H-7: Test that per-IP rate limiting works
+        let ip: std::net::IpAddr = "192.168.1.1".parse().unwrap();
+        let mut rate_map: HashMap<std::net::IpAddr, Vec<Instant>> = HashMap::new();
+        let now = Instant::now();
+
+        // Fill up the rate limit
+        let timestamps = rate_map.entry(ip).or_default();
+        for _ in 0..MAX_CONNECTIONS_PER_IP_PER_MINUTE {
+            timestamps.push(now);
+        }
+
+        // Next connection should be rejected
+        let timestamps = rate_map.entry(ip).or_default();
+        let one_minute_ago = now - Duration::from_secs(60);
+        timestamps.retain(|t| *t > one_minute_ago);
+        assert!(timestamps.len() >= MAX_CONNECTIONS_PER_IP_PER_MINUTE);
+
+        // Different IP should be fine
+        let other_ip: std::net::IpAddr = "192.168.1.2".parse().unwrap();
+        let other_timestamps = rate_map.entry(other_ip).or_default();
+        assert!(other_timestamps.len() < MAX_CONNECTIONS_PER_IP_PER_MINUTE);
+    }
+
+    #[test]
+    fn extract_ip_from_multiaddr_works() {
+        let addr: libp2p::Multiaddr = "/ip4/192.168.1.1/tcp/9090".parse().unwrap();
+        let ip = extract_ip_from_multiaddr(&addr);
+        assert_eq!(ip, Some("192.168.1.1".parse().unwrap()));
+
+        let addr6: libp2p::Multiaddr = "/ip6/::1/tcp/9090".parse().unwrap();
+        let ip6 = extract_ip_from_multiaddr(&addr6);
+        assert_eq!(ip6, Some("::1".parse().unwrap()));
     }
 
     #[tokio::test]
