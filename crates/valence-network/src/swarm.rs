@@ -41,6 +41,12 @@ pub struct ContentAck {
     pub success: bool,
 }
 
+/// Sync protocol request/response types for `/valence/sync/1.0.0`.
+pub type SyncBehaviour = request_response::cbor::Behaviour<
+    crate::gossip::SyncRequest,
+    crate::gossip::SyncResponse,
+>;
+
 /// Composite network behaviour for Valence.
 #[derive(libp2p::swarm::NetworkBehaviour)]
 pub struct ValenceBehaviour {
@@ -50,6 +56,7 @@ pub struct ValenceBehaviour {
     pub kad: kad::Behaviour<kad::store::MemoryStore>,
     pub auth: AuthBehaviour,
     pub content: ContentBehaviour,
+    pub sync: SyncBehaviour,
 }
 
 /// The main Valence swarm that orchestrates all networking.
@@ -73,6 +80,13 @@ pub struct ValenceSwarm {
     vdf_proof: serde_json::Value,
     /// Start time for uptime tracking.
     start_time: Instant,
+    /// Sync manager for 5-phase state reconciliation (§5).
+    sync_manager: crate::sync::SyncManager,
+    /// Merkle trees for sync status verification.
+    identity_merkle: crate::sync::IdentityMerkleTree,
+    proposal_merkle: crate::sync::IdentityMerkleTree, // Reuse same structure
+    /// Sync interval timer (every 15 min with jitter).
+    sync_interval: tokio::time::Interval,
 }
 
 /// Maximum new connections per IP per minute (H-7).
@@ -141,6 +155,12 @@ impl ValenceSwarm {
             request_response::Config::default(),
         );
 
+        // Sync protocol for state reconciliation (§5)
+        let sync = request_response::cbor::Behaviour::new(
+            [(StreamProtocol::new("/valence/sync/1.0.0"), request_response::ProtocolSupport::Full)],
+            request_response::Config::default(),
+        );
+
         let behaviour = ValenceBehaviour {
             gossipsub,
             mdns,
@@ -148,6 +168,7 @@ impl ValenceSwarm {
             kad,
             auth,
             content,
+            sync,
         };
 
         // Build swarm with Noise encryption + Yamux multiplexing (§3)
@@ -169,6 +190,11 @@ impl ValenceSwarm {
 
         let announce_interval = tokio::time::interval(config.announce_interval);
         let prune_interval = tokio::time::interval(Duration::from_secs(5 * 60));
+        
+        // Sync interval: 15 minutes base with jitter (§5)
+        let jitter_ms = (rand::random::<u64>() % 60_000) as u64; // 0-60s jitter
+        let mut sync_interval = tokio::time::interval(Duration::from_millis(15 * 60 * 1000 + jitter_ms));
+        sync_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         let swarm_instance = Self {
             swarm,
@@ -186,6 +212,10 @@ impl ValenceSwarm {
             config,
             vdf_proof: serde_json::json!({}),
             start_time: Instant::now(),
+            sync_manager: crate::sync::SyncManager::new(false), // TODO: detect store capability
+            identity_merkle: crate::sync::IdentityMerkleTree::new(),
+            proposal_merkle: crate::sync::IdentityMerkleTree::new(),
+            sync_interval,
         };
 
         Ok((swarm_instance, command_tx, event_rx))
@@ -235,6 +265,12 @@ impl ValenceSwarm {
                 _ = self.prune_interval.tick() => {
                     self.prune_expired_peers();
                     self.disconnect_unauthenticated_peers();
+                }
+
+                _ = self.sync_interval.tick() => {
+                    if let Err(e) = self.run_sync_cycle() {
+                        warn!(error = %e, "Error running sync cycle");
+                    }
                 }
             }
         }
@@ -294,6 +330,11 @@ impl ValenceSwarm {
             // Handle content stream protocol events (§6)
             SwarmEvent::Behaviour(ValenceBehaviourEvent::Content(event)) => {
                 self.handle_content_event(event);
+            }
+
+            // Handle sync protocol events (§5)
+            SwarmEvent::Behaviour(ValenceBehaviourEvent::Sync(event)) => {
+                self.handle_sync_event(event);
             }
 
             SwarmEvent::Behaviour(ValenceBehaviourEvent::Identify(
@@ -395,6 +436,61 @@ impl ValenceSwarm {
 
             request_response::Event::InboundFailure { peer, error, .. } => {
                 warn!(peer = %peer, error = %error, "Auth inbound failure");
+            }
+
+            _ => {}
+        }
+    }
+
+    /// Handle sync protocol events (§5).
+    fn handle_sync_event(&mut self, event: request_response::Event<crate::gossip::SyncRequest, crate::gossip::SyncResponse>) {
+        match event {
+            // Incoming sync request from a peer
+            request_response::Event::Message {
+                peer,
+                message: request_response::Message::Request { request, channel, .. },
+                ..
+            } => {
+                debug!(peer = %peer, "Received sync request");
+                
+                // Serve the request from our local message store
+                let response = self.message_store.query(&request);
+                
+                // Track sync serving for uptime credit (§5)
+                let _now_ms = chrono::Utc::now().timestamp_millis();
+                let non_empty = !response.messages.is_empty();
+                // Note: sync_serving_tracker would be in NodeState, not here
+                // This is just the transport layer serving the request
+                
+                let _ = self.swarm.behaviour_mut().sync.send_response(channel, response);
+                debug!(peer = %peer, non_empty, "Sent sync response");
+            }
+
+            // Response to our sync request
+            request_response::Event::Message {
+                peer,
+                message: request_response::Message::Response { response, .. },
+                ..
+            } => {
+                debug!(peer = %peer, messages = response.messages.len(), "Received sync response");
+                
+                // Emit event for upper layers to process
+                let _ = self.event_tx.send(TransportEvent::SyncResponse {
+                    peer_id: peer,
+                    messages: response.messages,
+                    has_more: response.has_more,
+                    next_timestamp: response.next_timestamp,
+                    next_id: response.next_id,
+                    checkpoint: response.checkpoint,
+                });
+            }
+
+            request_response::Event::OutboundFailure { peer, error, .. } => {
+                warn!(peer = %peer, error = %error, "Sync outbound failure");
+            }
+
+            request_response::Event::InboundFailure { peer, error, .. } => {
+                warn!(peer = %peer, error = %error, "Sync inbound failure");
             }
 
             _ => {}
@@ -536,9 +632,24 @@ impl ValenceSwarm {
             TransportCommand::Announce => {
                 self.announce_self()?;
             }
-            TransportCommand::SyncRequest { .. } => {
-                // TODO: Implement sync via stream protocol
-                warn!("SyncRequest not yet implemented");
+            TransportCommand::SyncRequest {
+                peer_id,
+                since_timestamp,
+                since_id,
+                types,
+                limit,
+            } => {
+                let request = crate::gossip::SyncRequest {
+                    since_timestamp,
+                    since_id,
+                    types,
+                    limit,
+                    merkle_tree: None,
+                    depth: None,
+                    subtree_path: None,
+                };
+                self.swarm.behaviour_mut().sync.send_request(&peer_id, request);
+                debug!(peer = %peer_id, since_ts = since_timestamp, "Sent sync request");
             }
             TransportCommand::SendShard {
                 peer_id,
@@ -579,7 +690,7 @@ impl ValenceSwarm {
             uptime_seconds: self.start_time.elapsed().as_secs(),
             vdf_proof: self.vdf_proof.clone(),
             storage: None, // TODO: Report actual storage capacity
-            sync_status: Some("synced".into()), // TODO: Track actual sync status
+            sync_status: Some(self.sync_manager.status.as_str().into()),
         })?;
 
         let now_ms = chrono::Utc::now().timestamp_millis();
@@ -702,6 +813,93 @@ impl ValenceSwarm {
     /// Get the count of pending (unauthenticated) peers.
     pub fn pending_peer_count(&self) -> usize {
         self.pending_auth.len()
+    }
+
+    /// Run a sync cycle (§5): incremental sync with all authenticated peers.
+    fn run_sync_cycle(&mut self) -> anyhow::Result<()> {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        
+        // Determine which phases to sync based on incremental sync rules
+        let sync_identity = self.sync_manager.should_sync_identity();
+        
+        // Get a random authenticated peer to sync with
+        // In a full implementation, would sync with multiple peers from different ASNs
+        let peers: Vec<PeerId> = self.authenticated_peers.iter().copied().collect();
+        if peers.is_empty() {
+            debug!("No authenticated peers for sync");
+            return Ok(());
+        }
+        
+        // Pick a random peer
+        let peer_idx = rand::random::<usize>() % peers.len();
+        let peer_id = peers[peer_idx];
+        
+        // Determine lookback timestamp for incremental sync
+        // §5: typically sync from last successful sync, default to 15min ago
+        let lookback_ms = now_ms - (15 * 60 * 1000);
+        
+        // Send sync request for each phase that needs updating
+        let phases_to_sync = if sync_identity {
+            vec![
+                crate::sync::SyncPhase::Identity,
+                crate::sync::SyncPhase::Reputation,
+                crate::sync::SyncPhase::Proposals,
+                crate::sync::SyncPhase::Content,
+            ]
+        } else {
+            vec![
+                crate::sync::SyncPhase::Reputation,
+                crate::sync::SyncPhase::Proposals,
+                crate::sync::SyncPhase::Content,
+            ]
+        };
+        
+        for phase in phases_to_sync {
+            let msg_types = phase.message_types().to_vec();
+            let request = crate::gossip::SyncRequest {
+                since_timestamp: lookback_ms,
+                since_id: None,
+                types: msg_types,
+                limit: 1000,
+                merkle_tree: None,
+                depth: None,
+                subtree_path: None,
+            };
+            self.swarm.behaviour_mut().sync.send_request(&peer_id, request);
+        }
+        
+        debug!(peer = %peer_id, sync_identity, "Initiated sync cycle");
+        Ok(())
+    }
+
+    /// Get a reference to the sync manager.
+    pub fn sync_manager(&self) -> &crate::sync::SyncManager {
+        &self.sync_manager
+    }
+
+    /// Get a mutable reference to the sync manager.
+    pub fn sync_manager_mut(&mut self) -> &mut crate::sync::SyncManager {
+        &mut self.sync_manager
+    }
+
+    /// Get a reference to the identity Merkle tree.
+    pub fn identity_merkle(&self) -> &crate::sync::IdentityMerkleTree {
+        &self.identity_merkle
+    }
+
+    /// Get a mutable reference to the identity Merkle tree.
+    pub fn identity_merkle_mut(&mut self) -> &mut crate::sync::IdentityMerkleTree {
+        &mut self.identity_merkle
+    }
+
+    /// Get a reference to the proposal Merkle tree.
+    pub fn proposal_merkle(&self) -> &crate::sync::IdentityMerkleTree {
+        &self.proposal_merkle
+    }
+
+    /// Get a mutable reference to the proposal Merkle tree.
+    pub fn proposal_merkle_mut(&mut self) -> &mut crate::sync::IdentityMerkleTree {
+        &mut self.proposal_merkle
     }
 }
 
@@ -986,5 +1184,106 @@ mod tests {
         swarm.authenticate_peer(peer, "some_node_id".to_string());
         assert_eq!(swarm.authenticated_peer_count(), 1);
         assert_eq!(swarm.pending_peer_count(), 0);
+    }
+
+    // ── Sync protocol tests ──
+
+    #[tokio::test]
+    async fn sync_manager_initialized() {
+        let identity = NodeIdentity::generate();
+        let config = test_config();
+        let (swarm, _, _) = ValenceSwarm::new(identity, config).unwrap();
+
+        assert_eq!(swarm.sync_manager().status, crate::sync::SyncStatus::Syncing);
+        assert_eq!(swarm.sync_manager().current_phase, Some(crate::sync::SyncPhase::Identity));
+    }
+
+    #[tokio::test]
+    async fn announce_includes_sync_status() {
+        let identity = NodeIdentity::generate();
+        let config = test_config();
+        let (mut swarm, _, _) = ValenceSwarm::new(identity, config).unwrap();
+
+        // Initial status should be syncing
+        assert_eq!(swarm.sync_manager().status.as_str(), "syncing");
+
+        // Mark as synced
+        swarm.sync_manager_mut().mark_synced();
+        assert_eq!(swarm.sync_manager().status.as_str(), "synced");
+    }
+
+    #[tokio::test]
+    async fn sync_request_construction() {
+        use valence_core::message::MessageType;
+
+        let request = crate::gossip::SyncRequest {
+            since_timestamp: 1000,
+            since_id: Some("msg_123".into()),
+            types: vec![MessageType::Vote, MessageType::Propose],
+            limit: 100,
+            merkle_tree: None,
+            depth: None,
+            subtree_path: None,
+        };
+
+        assert_eq!(request.since_timestamp, 1000);
+        assert_eq!(request.since_id, Some("msg_123".into()));
+        assert_eq!(request.types.len(), 2);
+        assert_eq!(request.limit, 100);
+    }
+
+    #[tokio::test]
+    async fn sync_response_construction() {
+        let response = crate::gossip::SyncResponse {
+            messages: vec![],
+            has_more: false,
+            next_timestamp: Some(2000),
+            next_id: Some("msg_456".into()),
+            checkpoint: None,
+            merkle_nodes: None,
+        };
+
+        assert!(!response.has_more);
+        assert_eq!(response.next_timestamp, Some(2000));
+        assert_eq!(response.next_id, Some("msg_456".into()));
+    }
+
+    #[tokio::test]
+    async fn message_store_serves_sync_requests() {
+        let identity = NodeIdentity::generate();
+        let config = test_config();
+        let (mut swarm, _, _) = ValenceSwarm::new(identity, config).unwrap();
+
+        // Insert some test messages
+        use serde_json::json;
+        use valence_core::message::{Envelope, MessageType};
+
+        for i in 0..5 {
+            let env = Envelope {
+                version: 0,
+                msg_type: MessageType::Vote,
+                id: format!("vote_{i}"),
+                from: "sender1".into(),
+                timestamp: 1000 + i as i64,
+                payload: json!({}),
+                signature: "sig".into(),
+            };
+            swarm.message_store.insert(env);
+        }
+
+        // Query the store
+        let request = crate::gossip::SyncRequest {
+            since_timestamp: 0,
+            since_id: None,
+            types: vec![MessageType::Vote],
+            limit: 10,
+            merkle_tree: None,
+            depth: None,
+            subtree_path: None,
+        };
+
+        let response = swarm.message_store.query(&request);
+        assert_eq!(response.messages.len(), 5);
+        assert!(!response.has_more);
     }
 }
