@@ -87,6 +87,8 @@ pub struct ValenceSwarm {
     proposal_merkle: crate::sync::IdentityMerkleTree, // Reuse same structure
     /// Sync interval timer (every 15 min with jitter).
     sync_interval: tokio::time::Interval,
+    /// Storage capacity and usage tracking for PEER_ANNOUNCE.
+    storage_stats: std::sync::Arc<std::sync::RwLock<crate::storage::StorageStats>>,
 }
 
 /// Maximum new connections per IP per minute (H-7).
@@ -212,10 +214,14 @@ impl ValenceSwarm {
             config,
             vdf_proof: serde_json::json!({}),
             start_time: Instant::now(),
-            sync_manager: crate::sync::SyncManager::new(false), // TODO: detect store capability
+            sync_manager: crate::sync::SyncManager::new(true), // ShardStore is now available
             identity_merkle: crate::sync::IdentityMerkleTree::new(),
             proposal_merkle: crate::sync::IdentityMerkleTree::new(),
             sync_interval,
+            storage_stats: std::sync::Arc::new(std::sync::RwLock::new(crate::storage::StorageStats {
+                total_bytes: 0,
+                capacity_bytes: 100 * 1024 * 1024 * 1024, // 100 GB default
+            })),
         };
 
         Ok((swarm_instance, command_tx, event_rx))
@@ -520,9 +526,28 @@ impl ValenceSwarm {
                             shard_data,
                         });
                     }
-                    ContentStreamMessage::StorageChallenge { .. } => {
-                        // TODO: Parse and emit StorageChallengeReceived event
-                        debug!(peer = %peer, "Received storage challenge (not yet implemented)");
+                    ContentStreamMessage::StorageChallenge { shard_hash, offset, direction, window_size, challenge_nonce } => {
+                        use crate::storage::{StorageChallenge, ChallengeDirection};
+                        
+                        let dir = match direction.as_str() {
+                            "before" => ChallengeDirection::Before,
+                            "after" => ChallengeDirection::After,
+                            _ => ChallengeDirection::After,
+                        };
+                        
+                        let challenge = StorageChallenge {
+                            shard_hash,
+                            offset,
+                            direction: dir,
+                            window_size,
+                            challenge_nonce,
+                        };
+                        
+                        let _ = self.event_tx.send(TransportEvent::StorageChallengeReceived {
+                            peer_id: peer,
+                            challenge,
+                        });
+                        debug!(peer = %peer, "Emitted StorageChallengeReceived event");
                     }
                     ContentStreamMessage::StorageProof { proof_hash } => {
                         let _ = self.event_tx.send(TransportEvent::StorageProofReceived {
@@ -683,13 +708,24 @@ impl ValenceSwarm {
 
         let addrs: Vec<String> = self.swarm.listeners().map(|a| a.to_string()).collect();
 
+        let storage_info = if let Ok(stats) = self.storage_stats.read() {
+            use crate::gossip::StorageCapacity;
+            Some(StorageCapacity {
+                allocated_bytes: stats.capacity_bytes,
+                available_bytes: stats.capacity_bytes.saturating_sub(stats.total_bytes),
+                shard_count: 0, // TODO: Track actual shard count
+            })
+        } else {
+            None
+        };
+
         let payload = serde_json::to_value(&PeerAnnounce {
             addresses: addrs,
             capabilities: vec!["propose".into(), "vote".into(), "store".into()],
             version: 0,
             uptime_seconds: self.start_time.elapsed().as_secs(),
             vdf_proof: self.vdf_proof.clone(),
-            storage: None, // TODO: Report actual storage capacity
+            storage: storage_info,
             sync_status: Some(self.sync_manager.status.as_str().into()),
         })?;
 

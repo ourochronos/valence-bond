@@ -561,13 +561,19 @@ impl MessageStore {
             (None, None)
         };
 
-        // TODO: Compute Merkle root checkpoint
+        // Compute Merkle root checkpoint
+        let checkpoint = if !messages.is_empty() {
+            Some(Self::compute_merkle_root(&messages))
+        } else {
+            None
+        };
+
         SyncResponse {
             messages,
             has_more,
             next_timestamp,
             next_id,
-            checkpoint: None,
+            checkpoint,
             merkle_nodes: None,
         }
     }
@@ -579,6 +585,51 @@ impl MessageStore {
 
     pub fn is_empty(&self) -> bool {
         self.messages.is_empty()
+    }
+
+    /// Compute a Merkle root from message IDs for checkpoint verification.
+    /// 
+    /// Algorithm: Sort message IDs lexicographically, then iteratively hash pairs
+    /// with SHA-256 until a single root hash remains.
+    fn compute_merkle_root(messages: &[Envelope]) -> String {
+        use sha2::{Digest, Sha256};
+
+        if messages.is_empty() {
+            return hex::encode(Sha256::digest(b""));
+        }
+
+        // Collect and sort message IDs
+        let mut hashes: Vec<Vec<u8>> = messages
+            .iter()
+            .map(|m| Sha256::digest(m.id.as_bytes()).to_vec())
+            .collect();
+        hashes.sort();
+
+        // Iteratively hash pairs until we have a single root
+        while hashes.len() > 1 {
+            let mut next_level = Vec::new();
+            let mut i = 0;
+            while i < hashes.len() {
+                if i + 1 < hashes.len() {
+                    // Hash pair
+                    let mut hasher = Sha256::new();
+                    hasher.update(&hashes[i]);
+                    hasher.update(&hashes[i + 1]);
+                    next_level.push(hasher.finalize().to_vec());
+                    i += 2;
+                } else {
+                    // Odd one out: hash with itself
+                    let mut hasher = Sha256::new();
+                    hasher.update(&hashes[i]);
+                    hasher.update(&hashes[i]);
+                    next_level.push(hasher.finalize().to_vec());
+                    i += 1;
+                }
+            }
+            hashes = next_level;
+        }
+
+        hex::encode(&hashes[0])
     }
 
     /// Remove messages older than a threshold (for archival per §11).

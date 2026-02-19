@@ -389,9 +389,87 @@ async fn cmd_run(
                         info!(peer = %peer_id, "Peer disconnected");
                         peer_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                     }
-                    _ => {
-                        // SyncResponse, ContentReceived, StorageChallenge, etc.
-                        // handled in future phases
+                    TransportEvent::SyncResponse { messages, .. } => {
+                        let now_ms = chrono::Utc::now().timestamp_millis();
+                        let mut state = node_state.write().await;
+                        let count = messages.len();
+                        for envelope in &messages {
+                            handler::handle_gossip_message(&mut state, envelope, now_ms);
+                        }
+                        tracing::debug!(count, "Processed sync response");
+                    }
+                    TransportEvent::ContentReceived { content_hash, shard_index, shard_data, .. } => {
+                        let state = node_state.write().await;
+                        if let Err(e) = state.shard_store.store_shard(&content_hash, shard_index, &shard_data) {
+                            tracing::warn!(error = %e, content = %content_hash, shard = shard_index, "Failed to store shard");
+                        } else {
+                            tracing::info!(content = %content_hash, shard = shard_index, bytes = shard_data.len(), "Stored shard");
+                        }
+                    }
+                    TransportEvent::StorageChallengeReceived { peer_id, challenge } => {
+                        use sha2::{Digest, Sha256};
+                        use valence_core::message::MessageType;
+                        use valence_crypto::signing::sign_message;
+                        
+                        let state = node_state.read().await;
+                        // Extract shard_index from shard_hash (format: "content_hash:shard_index")
+                        let parts: Vec<&str> = challenge.shard_hash.split(':').collect();
+                        if parts.len() == 2
+                            && let Ok(shard_index) = parts[1].parse::<u32>() {
+                                let content_hash = parts[0];
+                                match state.shard_store.read_shard(content_hash, shard_index) {
+                                    Ok(shard_data) => {
+                                        // Compute proof: hash(nonce || shard_data)
+                                        let mut hasher = Sha256::new();
+                                        hasher.update(challenge.challenge_nonce.as_bytes());
+                                        hasher.update(&shard_data);
+                                        let proof_hash = format!("{:x}", hasher.finalize());
+                                        
+                                        // Publish ChallengeResult message
+                                        let now_ms = chrono::Utc::now().timestamp_millis();
+                                        let payload = serde_json::json!({
+                                            "shard_hash": challenge.shard_hash,
+                                            "proof_hash": proof_hash,
+                                            "challenge_nonce": challenge.challenge_nonce,
+                                        });
+                                        let envelope = sign_message(&identity, MessageType::ChallengeResult, payload, now_ms);
+                                        if let Ok(data) = serde_json::to_vec(&envelope) {
+                                            let _ = cmd_tx.send(valence_network::transport::TransportCommand::Publish {
+                                                topic: "/valence/proposals".into(),
+                                                data,
+                                            });
+                                            tracing::debug!(peer = %peer_id, shard = %challenge.shard_hash, "Sent challenge proof");
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(error = %e, shard = %challenge.shard_hash, "Failed to read shard for challenge");
+                                    }
+                                }
+                            }
+                    }
+                    TransportEvent::StorageProofReceived { peer_id, proof } => {
+                        tracing::debug!(peer = %peer_id, proof = %proof.proof_hash, "Received storage proof");
+                        // Verification happens in the ChallengeResult gossip handler
+                    }
+                    TransportEvent::ContentRequested { peer_id, content_hash, offset, length } => {
+                        let state = node_state.read().await;
+                        // For now, assume offset/length map to shard_index (simplified)
+                        let shard_index = (offset / length) as u32;
+                        let content_hash_clone = content_hash.clone();
+                        match state.shard_store.read_shard(&content_hash, shard_index) {
+                            Ok(shard_data) => {
+                                let _ = cmd_tx.send(valence_network::transport::TransportCommand::SendShard {
+                                    peer_id,
+                                    content_hash: content_hash_clone.clone(),
+                                    shard_index,
+                                    shard_data,
+                                });
+                                tracing::debug!(peer = %peer_id, content = %content_hash_clone, shard = shard_index, "Sent shard");
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, peer = %peer_id, content = %content_hash, "Failed to read requested shard");
+                            }
+                        }
                     }
                 }
             }

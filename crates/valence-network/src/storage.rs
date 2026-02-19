@@ -6,6 +6,15 @@ use reed_solomon_erasure::galois_8::ReedSolomon;
 
 use valence_core::message::ErasureCoding;
 
+/// Storage capacity and usage statistics.
+#[derive(Debug, Clone, Default)]
+pub struct StorageStats {
+    /// Total bytes currently stored.
+    pub total_bytes: u64,
+    /// Maximum capacity in bytes.
+    pub capacity_bytes: u64,
+}
+
 /// A content shard — one piece of an erasure-coded artifact.
 #[derive(Debug, Clone)]
 pub struct Shard {
